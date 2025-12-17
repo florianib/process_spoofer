@@ -1,6 +1,3 @@
 [submodule "winpe"]
 	path = src/winpe
 	url = https://github.com/florianib/winpe
-[submodule "src/winpe"]
-	path = src/winpe
-	url = https://github.com/florianib/winpe

