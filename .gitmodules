@@ -1,0 +1,3 @@
+[submodule "winpe"]
+	path = winpe
+	url = https://github.com/florianib/winpe
